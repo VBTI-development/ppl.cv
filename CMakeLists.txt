@@ -34,7 +34,7 @@ endif()
 # --------------------------------------------------------------------------- #
 
 set(PPLCV_VERSION_MAJOR 0)
-set(PPLCV_VERSION_MINOR 7)
+set(PPLCV_VERSION_MINOR 8)
 set(PPLCV_VERSION_PATCH 0)
 
 # --------------------------------------------------------------------------- #

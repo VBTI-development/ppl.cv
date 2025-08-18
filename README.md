@@ -31,7 +31,7 @@ This project is configured by cmake scripts. A simple build script is provided.
 #### Linux
 
 ```bash
-$ git clone https://github.com/openppl-public/ppl.cv.git
+$ git clone https://github.com/VBTI-development/ppl.cv.git
 $ cd ppl.cv
 $ ./build.sh x86_64                         # for linux-x86_64
 $ ./build.sh aarch64                        # for linux-aarch64
