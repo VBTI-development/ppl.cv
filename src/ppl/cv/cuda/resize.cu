@@ -29,12 +29,9 @@ namespace cuda {
 #define INTER_RESIZE_COEF_SCALE (1 << INTER_RESIZE_COEF_BITS)
 #define CAST_BITS (INTER_RESIZE_COEF_BITS << 1)
 
-static texture<uchar, cudaTextureType2D,
-               cudaReadModeNormalizedFloat> uchar_c1_ref;
-static texture<uchar4, cudaTextureType2D,
-               cudaReadModeNormalizedFloat> uchar_c4_ref;
-static texture<float, cudaTextureType2D,
-               cudaReadModeElementType> float_c1_ref;
+cudaTextureObject_t uchar_c1_tex = 0;
+cudaTextureObject_t uchar_c4_tex = 0;
+cudaTextureObject_t float_c1_tex = 0;
 
 template <typename T>
 __DEVICE__
@@ -110,7 +107,7 @@ uchar4 bilinearSample(uchar4 values[][2], int x0, int x1, int y0, int y1) {
 }
 
 __global__
-void resizeLinearTextureKernel(uchar* dst, int dst_rows, int dst_cols,
+void resizeLinearTextureKernel(const cudaTextureObject_t tex, uchar* dst, int dst_rows, int dst_cols,
                                int channels, int dst_stride, float col_scale,
                                float row_scale) {
   int element_x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -123,14 +120,14 @@ void resizeLinearTextureKernel(uchar* dst, int dst_rows, int dst_cols,
   float coordinate_y = (element_y + 0.5f) * row_scale;
 
   if (channels == 1) {
-    float value = tex2D(uchar_c1_ref, coordinate_x, coordinate_y);
+    float value = tex2D<float>(tex, coordinate_x, coordinate_y);
     value *= 255.0f;
 
     uchar* output = (uchar*)(dst + element_y * dst_stride);
     output[element_x] = saturateCast(value);
   }
   else {  // channels == 4
-    float4 value = tex2D(uchar_c4_ref, coordinate_x, coordinate_y);
+    float4 value = tex2D<float4>(tex, coordinate_x, coordinate_y);
     value.x *= 255.0f;
     value.y *= 255.0f;
     value.z *= 255.0f;
@@ -142,7 +139,7 @@ void resizeLinearTextureKernel(uchar* dst, int dst_rows, int dst_cols,
 }
 
 __global__
-void resizeLinearTextureKernel(float* dst, int dst_rows, int dst_cols,
+void resizeLinearTextureKernel(const cudaTextureObject_t float_c1_tex, float* dst, int dst_rows, int dst_cols,
                                int channels, int dst_stride, float col_scale,
                                float row_scale) {
   int element_x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -155,7 +152,7 @@ void resizeLinearTextureKernel(float* dst, int dst_rows, int dst_cols,
   float coordinate_y = (element_y + 0.5f) * row_scale;
 
   if (channels == 1) {
-    float value = tex2D(float_c1_ref, coordinate_x, coordinate_y);
+    float value = tex2D<float>(float_c1_tex, coordinate_x, coordinate_y);
 
     float* output = (float*)(dst + element_y * dst_stride);
     output[element_x] = value;
@@ -742,7 +739,7 @@ void resizeAreaC4Kernel1(const T* src, int src_rows, int src_cols,
 }
 
 __global__
-void resizeAreaTextureKernel(uchar* dst, int dst_rows, int dst_cols,
+void resizeAreaTextureKernel(const cudaTextureObject_t tex, uchar* dst, int dst_rows, int dst_cols,
                              int channels, int dst_stride, float col_scale,
                              float row_scale, float inv_col_scale,
                              float inv_row_scale) {
@@ -764,14 +761,14 @@ void resizeAreaTextureKernel(uchar* dst, int dst_rows, int dst_cols,
   float_y += (int_y + 0.5f);
 
   if (channels == 1) {
-    float value = tex2D(uchar_c1_ref, float_x, float_y);
+    float value = tex2D<float>(tex, float_x, float_y);
     value *= 255.0f;
 
     uchar* output = (uchar*)(dst + element_y * dst_stride);
     output[element_x] = saturateCast(value);
   }
   else {  // channels == 4
-    float4 value = tex2D(uchar_c4_ref, float_x, float_y);
+    float4 value = tex2D<float4>(tex, float_x, float_y);
     value.x *= 255.0f;
     value.y *= 255.0f;
     value.z *= 255.0f;
@@ -783,7 +780,7 @@ void resizeAreaTextureKernel(uchar* dst, int dst_rows, int dst_cols,
 }
 
 __global__
-void resizeAreaTextureKernel(float* dst, int dst_rows, int dst_cols,
+void resizeAreaTextureKernel(const cudaTextureObject_t float_c1_tex, float* dst, int dst_rows, int dst_cols,
                              int channels, int dst_stride, float col_scale,
                              float row_scale, float inv_col_scale,
                              float inv_row_scale) {
@@ -805,7 +802,7 @@ void resizeAreaTextureKernel(float* dst, int dst_rows, int dst_cols,
   float_y += (int_y + 0.5f);
 
   if (channels == 1) {
-    float value = tex2D(float_c1_ref, float_x, float_y);
+    float value = tex2D<float>(float_c1_tex, float_x, float_y);
 
     float* output = (float*)(dst + element_y * dst_stride);
     output[element_x] = value;
@@ -1061,36 +1058,64 @@ RetCode resize(const uchar* src, int src_rows, int src_cols, int channels,
 
   if (interpolation == INTERPOLATION_LINEAR) {
     if (channels == 1 && (src_pitch & (texture_alignment - 1)) == 0) {
-      cudaChannelFormatDesc desc = cudaCreateChannelDesc<uchar>();
-      uchar_c1_ref.normalized = false;
-      uchar_c1_ref.filterMode = cudaFilterModeLinear;
-      uchar_c1_ref.addressMode[0] = cudaAddressModeClamp;
-      uchar_c1_ref.addressMode[1] = cudaAddressModeClamp;
-      code = cudaBindTexture2D(0, uchar_c1_ref, src, desc, src_cols, src_rows,
-                               (size_t)src_stride);
+      cudaResourceDesc resDesc;
+      cudaTextureDesc texDesc;
+      memset(&resDesc, 0, sizeof(resDesc));
+      resDesc.resType = cudaResourceTypePitch2D;
+      resDesc.res.pitch2D.devPtr = (void*)src;
+      resDesc.res.pitch2D.desc = cudaCreateChannelDesc<uchar>();
+      resDesc.res.pitch2D.width = src_cols;
+      resDesc.res.pitch2D.height = src_rows;
+      resDesc.res.pitch2D.pitchInBytes = src_stride;
+
+      memset(&texDesc, 0, sizeof(texDesc));
+      texDesc.addressMode[0] = cudaAddressModeClamp;
+      texDesc.addressMode[1] = cudaAddressModeClamp;
+      texDesc.filterMode = cudaFilterModeLinear;
+      texDesc.readMode = cudaReadModeNormalizedFloat;
+      texDesc.normalizedCoords = false;
+
+      code = cudaCreateTextureObject(&uchar_c1_tex, &resDesc, &texDesc, nullptr);
+
       if (code != cudaSuccess) {
         LOG(ERROR) << "CUDA texture error: " << cudaGetErrorString(code);
         return RC_DEVICE_RUNTIME_ERROR;
       }
 
-      resizeLinearTextureKernel<<<grid, block, 0, stream>>>(dst, dst_rows,
+      resizeLinearTextureKernel<<<grid, block, 0, stream>>>(uchar_c1_tex, dst, dst_rows,
           dst_cols, channels, dst_stride, col_scale, row_scale);
+
+      cudaDestroyTextureObject(uchar_c1_tex);
     }
     else if (channels == 4 && (src_pitch & (texture_alignment - 1)) == 0) {
-      cudaChannelFormatDesc desc = cudaCreateChannelDesc<uchar4>();
-      uchar_c4_ref.normalized = false;
-      uchar_c4_ref.filterMode = cudaFilterModeLinear;
-      uchar_c4_ref.addressMode[0] = cudaAddressModeClamp;
-      uchar_c4_ref.addressMode[1] = cudaAddressModeClamp;
-      code = cudaBindTexture2D(0, uchar_c4_ref, src, desc, src_cols, src_rows,
-                               (size_t)src_stride);
+      cudaResourceDesc resDesc;
+      cudaTextureDesc texDesc;
+      memset(&resDesc, 0, sizeof(resDesc));
+      resDesc.resType = cudaResourceTypePitch2D;
+      resDesc.res.pitch2D.devPtr = (void*)src;
+      resDesc.res.pitch2D.desc = cudaCreateChannelDesc<uchar4>();
+      resDesc.res.pitch2D.width = src_cols;
+      resDesc.res.pitch2D.height = src_rows;
+      resDesc.res.pitch2D.pitchInBytes = src_stride;
+
+      memset(&texDesc, 0, sizeof(texDesc));
+      texDesc.addressMode[0] = cudaAddressModeClamp;
+      texDesc.addressMode[1] = cudaAddressModeClamp;
+      texDesc.filterMode = cudaFilterModeLinear;
+      texDesc.readMode = cudaReadModeNormalizedFloat;
+      texDesc.normalizedCoords = false;
+
+      code = cudaCreateTextureObject(&uchar_c4_tex, &resDesc, &texDesc, nullptr);
+
       if (code != cudaSuccess) {
         LOG(ERROR) << "CUDA texture error: " << cudaGetErrorString(code);
         return RC_DEVICE_RUNTIME_ERROR;
       }
 
-      resizeLinearTextureKernel<<<grid, block, 0, stream>>>(dst, dst_rows,
+      resizeLinearTextureKernel<<<grid, block, 0, stream>>>(uchar_c4_tex, dst, dst_rows,
           dst_cols, channels, dst_stride, col_scale, row_scale);
+
+      cudaDestroyTextureObject(uchar_c4_tex);
     }
     else {
       resizeLinearKernel<<<grid, block, 0, stream>>>(src, src_rows, src_cols,
@@ -1154,38 +1179,64 @@ RetCode resize(const uchar* src, int src_rows, int src_cols, int channels,
     }
     else {
       if (channels == 1 && (src_pitch & (texture_alignment - 1)) == 0) {
-        cudaChannelFormatDesc desc = cudaCreateChannelDesc<uchar>();
-        uchar_c1_ref.normalized = false;
-        uchar_c1_ref.filterMode = cudaFilterModeLinear;
-        uchar_c1_ref.addressMode[0] = cudaAddressModeClamp;
-        uchar_c1_ref.addressMode[1] = cudaAddressModeClamp;
-        code = cudaBindTexture2D(0, uchar_c1_ref, src, desc, src_cols, src_rows,
-                                (size_t)src_stride);
+        cudaResourceDesc resDesc;
+        cudaTextureDesc texDesc;
+        memset(&resDesc, 0, sizeof(resDesc));
+        resDesc.resType = cudaResourceTypePitch2D;
+        resDesc.res.pitch2D.devPtr = (void*)src;
+        resDesc.res.pitch2D.desc = cudaCreateChannelDesc<uchar>();
+        resDesc.res.pitch2D.width = src_cols;
+        resDesc.res.pitch2D.height = src_rows;
+        resDesc.res.pitch2D.pitchInBytes = src_stride;
+
+        memset(&texDesc, 0, sizeof(texDesc));
+        texDesc.addressMode[0] = cudaAddressModeClamp;
+        texDesc.addressMode[1] = cudaAddressModeClamp;
+        texDesc.filterMode = cudaFilterModeLinear;
+        texDesc.readMode = cudaReadModeNormalizedFloat;
+        texDesc.normalizedCoords = false;
+
+        code = cudaCreateTextureObject(&uchar_c1_tex, &resDesc, &texDesc, nullptr);
         if (code != cudaSuccess) {
           LOG(ERROR) << "CUDA texture error: " << cudaGetErrorString(code);
           return RC_DEVICE_RUNTIME_ERROR;
         }
 
-        resizeAreaTextureKernel<<<grid, block, 0, stream>>>(dst, dst_rows,
+        resizeAreaTextureKernel<<<grid, block, 0, stream>>>(uchar_c1_tex, dst, dst_rows,
             dst_cols, channels, dst_stride, col_scale, row_scale, inv_col_scale,
             inv_row_scale);
+
+        cudaDestroyTextureObject(uchar_c1_tex);
       }
       else if (channels == 4 && (src_pitch & (texture_alignment - 1)) == 0) {
-        cudaChannelFormatDesc desc = cudaCreateChannelDesc<uchar4>();
-        uchar_c4_ref.normalized = false;
-        uchar_c4_ref.filterMode = cudaFilterModeLinear;
-        uchar_c4_ref.addressMode[0] = cudaAddressModeClamp;
-        uchar_c4_ref.addressMode[1] = cudaAddressModeClamp;
-        code = cudaBindTexture2D(0, uchar_c4_ref, src, desc, src_cols, src_rows,
-                                (size_t)src_stride);
+        cudaResourceDesc resDesc;
+        cudaTextureDesc texDesc;
+        memset(&resDesc, 0, sizeof(resDesc));
+        resDesc.resType = cudaResourceTypePitch2D;
+        resDesc.res.pitch2D.devPtr = (void*)src;
+        resDesc.res.pitch2D.desc = cudaCreateChannelDesc<uchar4>();
+        resDesc.res.pitch2D.width = src_cols;
+        resDesc.res.pitch2D.height = src_rows;
+        resDesc.res.pitch2D.pitchInBytes = src_stride;
+
+        memset(&texDesc, 0, sizeof(texDesc));
+        texDesc.addressMode[0] = cudaAddressModeClamp;
+        texDesc.addressMode[1] = cudaAddressModeClamp;
+        texDesc.filterMode = cudaFilterModeLinear;
+        texDesc.readMode = cudaReadModeNormalizedFloat;
+        texDesc.normalizedCoords = false;
+
+        code = cudaCreateTextureObject(&uchar_c4_tex, &resDesc, &texDesc, nullptr);
         if (code != cudaSuccess) {
           LOG(ERROR) << "CUDA texture error: " << cudaGetErrorString(code);
           return RC_DEVICE_RUNTIME_ERROR;
         }
 
-        resizeAreaTextureKernel<<<grid, block, 0, stream>>>(dst, dst_rows,
+        resizeAreaTextureKernel<<<grid, block, 0, stream>>>(uchar_c4_tex, dst, dst_rows,
             dst_cols, channels, dst_stride, col_scale, row_scale, inv_col_scale,
             inv_row_scale);
+          
+        cudaDestroyTextureObject(uchar_c4_tex);
       }
       else {
         resizeAreaKernel2<<<grid, block, 0, stream>>>(src, src_rows, src_cols,
@@ -1256,20 +1307,33 @@ RetCode resize(const float* src, int src_rows, int src_cols, int channels,
 
   if (interpolation == INTERPOLATION_LINEAR) {
     if (channels == 1 && (src_pitch & (texture_alignment - 1)) == 0) {
-      cudaChannelFormatDesc desc = cudaCreateChannelDesc<float>();
-      float_c1_ref.normalized = false;
-      float_c1_ref.filterMode = cudaFilterModeLinear;
-      float_c1_ref.addressMode[0] = cudaAddressModeClamp;
-      float_c1_ref.addressMode[1] = cudaAddressModeClamp;
-      code = cudaBindTexture2D(0, float_c1_ref, src, desc, src_cols, src_rows,
-                               (size_t)src_stride * sizeof(float));
+      cudaResourceDesc resDesc;
+      cudaTextureDesc texDesc;
+      memset(&resDesc, 0, sizeof(resDesc));
+      resDesc.resType = cudaResourceTypePitch2D;
+      resDesc.res.pitch2D.devPtr = (void*)src;
+      resDesc.res.pitch2D.desc = cudaCreateChannelDesc<float>();
+      resDesc.res.pitch2D.width = src_cols;
+      resDesc.res.pitch2D.height = src_rows;
+      resDesc.res.pitch2D.pitchInBytes = src_stride * sizeof(float);
+
+      memset(&texDesc, 0, sizeof(texDesc));
+      texDesc.addressMode[0] = cudaAddressModeClamp;
+      texDesc.addressMode[1] = cudaAddressModeClamp;
+      texDesc.filterMode = cudaFilterModeLinear;
+      texDesc.readMode = cudaReadModeElementType;
+      texDesc.normalizedCoords = false;
+
+      code = cudaCreateTextureObject(&float_c1_tex, &resDesc, &texDesc, nullptr);
       if (code != cudaSuccess) {
         LOG(ERROR) << "CUDA texture error: " << cudaGetErrorString(code);
         return RC_DEVICE_RUNTIME_ERROR;
       }
 
-      resizeLinearTextureKernel<<<grid, block, 0, stream>>>(dst, dst_rows,
+      resizeLinearTextureKernel<<<grid, block, 0, stream>>>(float_c1_tex, dst, dst_rows,
           dst_cols, channels, dst_stride, col_scale, row_scale);
+
+      cudaDestroyTextureObject(float_c1_tex);
     }
     else {
       resizeLinearKernel<<<grid, block, 0, stream>>>(src, src_rows, src_cols,
@@ -1333,21 +1397,34 @@ RetCode resize(const float* src, int src_rows, int src_cols, int channels,
     }
     else {
       if (channels == 1 && (src_pitch & (texture_alignment - 1)) == 0) {
-        cudaChannelFormatDesc desc = cudaCreateChannelDesc<float>();
-        float_c1_ref.normalized = false;
-        float_c1_ref.filterMode = cudaFilterModeLinear;
-        float_c1_ref.addressMode[0] = cudaAddressModeClamp;
-        float_c1_ref.addressMode[1] = cudaAddressModeClamp;
-        code = cudaBindTexture2D(0, float_c1_ref, src, desc, src_cols, src_rows,
-                                (size_t)src_stride * sizeof(float));
+        cudaResourceDesc resDesc;
+        cudaTextureDesc texDesc;
+        memset(&resDesc, 0, sizeof(resDesc));
+        resDesc.resType = cudaResourceTypePitch2D;
+        resDesc.res.pitch2D.devPtr = (void*)src;
+        resDesc.res.pitch2D.desc = cudaCreateChannelDesc<float>();
+        resDesc.res.pitch2D.width = src_cols;
+        resDesc.res.pitch2D.height = src_rows;
+        resDesc.res.pitch2D.pitchInBytes = src_stride * sizeof(float);
+
+        memset(&texDesc, 0, sizeof(texDesc));
+        texDesc.addressMode[0] = cudaAddressModeClamp;
+        texDesc.addressMode[1] = cudaAddressModeClamp;
+        texDesc.filterMode = cudaFilterModeLinear;
+        texDesc.readMode = cudaReadModeElementType;
+        texDesc.normalizedCoords = false;
+
+        code = cudaCreateTextureObject(&float_c1_tex, &resDesc, &texDesc, nullptr);
         if (code != cudaSuccess) {
           LOG(ERROR) << "CUDA texture error: " << cudaGetErrorString(code);
           return RC_DEVICE_RUNTIME_ERROR;
         }
 
-        resizeAreaTextureKernel<<<grid, block, 0, stream>>>(dst, dst_rows,
+        resizeAreaTextureKernel<<<grid, block, 0, stream>>>(float_c1_tex, dst, dst_rows,
             dst_cols, channels, dst_stride, col_scale, row_scale, inv_col_scale,
             inv_row_scale);
+        
+        cudaDestroyTextureObject(float_c1_tex);
       }
       else {
         resizeAreaKernel2<<<grid, block, 0, stream>>>(src, src_rows, src_cols,
